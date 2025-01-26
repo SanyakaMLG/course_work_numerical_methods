@@ -12,6 +12,7 @@ from torchvision import transforms, models
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torch import nn, optim
+from torch.optim.optimizer import Optimizer
 
 WORKER_DEVICE = None
 
@@ -24,6 +25,47 @@ torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
 
 os.environ["PYTHONHASHSEED"] = '42'
+
+class MyNAG(Optimizer):
+    def __init__(self,
+                 params,
+                 lr=0.01,
+                 momentum=0.9):
+        if lr < 0.0:
+            raise ValueError(f"Некорректное значение lr: {lr}")
+        if momentum < 0.0:
+            raise ValueError(f"Некорректное значение momentum: {momentum}")
+
+        defaults = dict(lr=lr,
+                        momentum=momentum)
+        super().__init__(params, defaults)
+
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad.data
+
+                param_state = self.state[p]
+                if 'momentum_buffer' not in param_state:
+                    buf = param_state['momentum_buffer'] = grad.clone().detach()
+                else:
+                    buf = param_state['momentum_buffer']
+                    buf.mul_(momentum).add_(grad)
+
+                nesterov_grad = grad.add(buf, alpha=momentum)
+                p.data.add_(nesterov_grad, alpha=-lr)
+
+        return loss
 
 def create_dataframe(data_dir):
     data = []
@@ -319,11 +361,11 @@ def evaluate_on_device(ind):
 
     model = FlexibleResNet(block_type, num_blocks_list, 2, act_name, base_ch).to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.parameters(), lr=0.01, nesterov=True, momentum=0.9)
+    optimizer = MyNAG(model.parameters(), lr=0.02)
 
     best_val_acc = 0
     
-    num_epochs = 25
+    num_epochs = 50
     for epoch in range(num_epochs):
         train_model(model, criterion, optimizer, TRAIN_LOADER, device)
 
