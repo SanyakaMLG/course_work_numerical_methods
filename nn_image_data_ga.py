@@ -1,30 +1,24 @@
-import torch.multiprocessing as mp
-
 import os
-import multiprocessing
 import random
-import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
-from deap import base, creator, tools, algorithms
-
-from torchvision import transforms, models
 import torch
+import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from torch import nn, optim
 from torch.optim.optimizer import Optimizer
-
-WORKER_DEVICE = None
+from torchvision import transforms
+from sklearn.model_selection import train_test_split
+from concurrent.futures import ProcessPoolExecutor
+from PIL import Image
+import pandas as pd
 
 random.seed(42)
 np.random.seed(42)
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
-
-torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
-
+torch.backends.cudnn.benchmark = False
 os.environ["PYTHONHASHSEED"] = '42'
+
 
 class MyNAG(Optimizer):
     def __init__(self,
@@ -67,24 +61,6 @@ class MyNAG(Optimizer):
 
         return loss
 
-def create_dataframe(data_dir):
-    data = []
-    for split in ['train', 'test']:
-        for label in ['benign', 'malignant']:
-            folder = os.path.join(data_dir, split, label)
-            for filename in os.listdir(folder):
-                if filename.endswith(('.png', '.jpg', '.jpeg')):  # Убедимся, что это изображение
-                    filepath = os.path.join(folder, filename)
-                    data.append({
-                        'path': filepath,
-                        'label': 0 if label == 'benign' else 1,
-                        'split': split
-                    })
-    return pd.DataFrame(data)
-
-data_dir = "data"
-dataframe = create_dataframe(data_dir)
-print(dataframe.head())
 
 class ImageDataset(Dataset):
     def __init__(self, dataframe, transform=None):
@@ -95,100 +71,33 @@ class ImageDataset(Dataset):
         return len(self.dataframe)
 
     def __getitem__(self, idx):
-        label = self.dataframe.iloc[idx]['label']
-        index = self.dataframe.index[idx]
-        image = torch.load(f'processed/{index}.pt')
+        row = self.dataframe.iloc[idx]
+        image = Image.open(row['path']).convert('RGB')
+        label = row['label']
+
+        if self.transform:
+            image = self.transform(image)
 
         return image, label
-    
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-])
 
-def get_dataloader(dataframe, transform, batch_size=32, shuffle=True):
-    dataset = ImageDataset(dataframe, transform=transform)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
-
-train_df = dataframe[dataframe['split'] == 'train'].copy()
-test_df = dataframe[dataframe['split'] == 'test'].copy()
-
-train_df, val_df = train_test_split(train_df, test_size=0.2, random_state=42)
-
-train_loader = get_dataloader(train_df, transform=transform, batch_size=64, shuffle=True)
-val_loader   = get_dataloader(val_df,   transform=transform, batch_size=64, shuffle=False)
-test_loader  = get_dataloader(test_df,  transform=transform, batch_size=64, shuffle=False)
-
-def train_model(model, criterion, optimizer, train_loader, device):
-    model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
-
-    for images, labels in train_loader:
-        images, labels = images.to(device), labels.to(device)
-
-        # Forward pass
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-
-        # Backward pass and optimization
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        # Статистика
-        running_loss += loss.item()
-        _, predicted = outputs.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
-
-    epoch_loss = running_loss / len(train_loader)
-    epoch_acc = 100. * correct / total
-    return epoch_loss, epoch_acc
-
-def evaluate_model(model, criterion, test_loader, device):
-    model.eval()
-    running_loss = 0.0
-    correct = 0
-    total = 0
-
-    with torch.no_grad():
-        for images, labels in test_loader:
-            images, labels = images.to(device), labels.to(device)
-
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-
-            running_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-
-    epoch_loss = running_loss / len(test_loader)
-    epoch_acc = 100. * correct / total
-    return epoch_loss, epoch_acc
 
 class BasicBlock(nn.Module):
     expansion = 1
+
     def __init__(self, in_planes, planes, stride=1, activation=nn.ReLU):
-        super(BasicBlock, self).__init__()
+        super().__init__()
         self.activation = activation()
         self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride,
                                padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
-
         self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1,
                                padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
 
         self.shortcut = nn.Sequential()
-        
         if stride != 1 or in_planes != planes:
             self.shortcut = nn.Sequential(
-                nn.Conv2d(in_planes, planes,
-                          kernel_size=1, stride=stride, bias=False),
+                nn.Conv2d(in_planes, planes, kernel_size=1, stride=stride, bias=False),
                 nn.BatchNorm2d(planes)
             )
 
@@ -199,20 +108,18 @@ class BasicBlock(nn.Module):
         out = self.activation(out)
         return out
 
-    
+
 class Bottleneck(nn.Module):
     expansion = 4
-    def __init__(self, in_planes, planes, stride=1, activation=nn.ReLU):
-        super(Bottleneck, self).__init__()
-        self.activation = activation()
 
+    def __init__(self, in_planes, planes, stride=1, activation=nn.ReLU):
+        super().__init__()
+        self.activation = activation()
         self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=1, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
-
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3,
-                               stride=stride, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
+                               padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
-
         self.conv3 = nn.Conv2d(planes, planes * self.expansion,
                                kernel_size=1, bias=False)
         self.bn3 = nn.BatchNorm2d(planes * self.expansion)
@@ -232,56 +139,41 @@ class Bottleneck(nn.Module):
         out += self.shortcut(x)
         out = self.activation(out)
         return out
-    
-class FlexibleResNet(nn.Module):
-    def __init__(self, block_type, num_blocks_list, 
-                 num_classes=2, 
-                 activation_name="relu",
-                 base_channels=64):
-        """
-        block_type: класс блока (BasicBlock или Bottleneck)
-        num_blocks_list: список [n1, n2, n3, n4] (сколько блоков в каждом из 4-х stage)
-        activation_name: "relu" / "tanh" / "sigmoid"
-        base_channels: кол-во каналов в первой свёртке
-        """
-        super(FlexibleResNet, self).__init__()
 
+
+class FlexibleResNet(nn.Module):
+    def __init__(self, block_type, num_blocks_list, num_classes=2,
+                 activation_name="relu", base_channels=64):
+        super().__init__()
         act_map = {
             "relu": nn.ReLU,
             "tanh": nn.Tanh,
             "sigmoid": nn.Sigmoid
         }
         self.activation = act_map.get(activation_name, nn.ReLU)
-
         self.in_planes = base_channels
-        self.block = block_type
 
-        self.conv1 = nn.Conv2d(3, self.in_planes, kernel_size=7, stride=2,
+        self.conv1 = nn.Conv2d(3, base_channels, kernel_size=7, stride=2,
                                padding=3, bias=False)
-        self.bn1 = nn.BatchNorm2d(self.in_planes)
+        self.bn1 = nn.BatchNorm2d(base_channels)
         self.act1 = self.activation()
         self.pool1 = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
-        self.layer1 = self._make_layer(self.block, base_channels,      num_blocks_list[0], stride=1)
-        self.layer2 = self._make_layer(self.block, base_channels*2,    num_blocks_list[1], stride=2)
-        self.layer3 = self._make_layer(self.block, base_channels*4,    num_blocks_list[2], stride=2)
-        self.layer4 = self._make_layer(self.block, base_channels*8,    num_blocks_list[3], stride=2)
+        self.layer1 = self._make_layer(block_type, base_channels, num_blocks_list[0], 1)
+        self.layer2 = self._make_layer(block_type, base_channels * 2, num_blocks_list[1], 2)
+        self.layer3 = self._make_layer(block_type, base_channels * 4, num_blocks_list[2], 2)
+        self.layer4 = self._make_layer(block_type, base_channels * 8, num_blocks_list[3], 2)
 
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-
-        final_planes = (base_channels*8) * (block_type.expansion if hasattr(block_type, 'expansion') else 1)
+        final_planes = base_channels * 8 * (block_type.expansion if hasattr(block_type, 'expansion') else 1)
         self.fc = nn.Linear(final_planes, num_classes)
 
     def _make_layer(self, block, planes, num_blocks, stride):
         layers = []
-
-        strides = [stride] + [1]*(num_blocks-1)
+        strides = [stride] + [1] * (num_blocks - 1)
         for s in strides:
-            layers.append(block(self.in_planes, planes, s, activation=self.activation))
-            if hasattr(block, 'expansion'):
-                self.in_planes = planes * block.expansion
-            else:
-                self.in_planes = planes
+            layers.append(block(self.in_planes, planes, s, self.activation))
+            self.in_planes = planes * block.expansion if hasattr(block, 'expansion') else planes
         return nn.Sequential(*layers)
 
     def forward(self, x):
@@ -291,187 +183,229 @@ class FlexibleResNet(nn.Module):
         x = self.layer3(x)
         x = self.layer4(x)
         x = self.avgpool(x)
-        x = x.view(x.size(0), -1)
+        x = torch.flatten(x, 1)
         x = self.fc(x)
         return x
-    
-creator.create("FitnessMax", base.Fitness, weights=(1.0,))  
-creator.create("Individual", list, fitness=creator.FitnessMax)
 
-toolbox = base.Toolbox()
 
-def init_block_type():
-    # 0 -> BasicBlock, 1 -> Bottleneck
-    return random.randint(0,1)
+class Individual:
+    def __init__(self, genes):
+        self.genes = genes  # [block_type, n1, n2, n3, n4, activation, base_ch]
+        self.fitness = 0.0
 
-def init_num_blocks():
-    return random.randint(2,6)
 
-def init_activation():
-    return random.choice(["relu", "tanh", "sigmoid"])
+class GeneticOptimizer:
+    def __init__(self, pop_size=15, n_generations=10, cx_prob=0.5, mut_prob=0.2,
+                 devices=[0], n_epochs=5):
+        self.pop_size = pop_size
+        self.n_generations = n_generations
+        self.cx_prob = cx_prob
+        self.mut_prob = mut_prob
+        self.devices = devices
+        self.n_epochs = n_epochs
+        self.hall_of_fame = None
 
-def init_base_channels():
-    return random.choice([32, 64, 128])
+    def _create_individual(self):
+        genes = [
+            random.randint(0, 1),  # block_type (0=Basic, 1=Bottleneck)
+            random.randint(2, 6),  # n1
+            random.randint(2, 6),  # n2
+            random.randint(2, 6),  # n3
+            random.randint(2, 6),  # n4
+            random.choice(["relu", "tanh", "sigmoid"]),  # activation
+            random.choice([32, 64, 128])  # base_channels
+        ]
+        return Individual(genes)
 
-def init_individual():
-    """
-    Примерная структура особи (индивида):
-      [block_type,
-       n_blocks_1, n_blocks_2, n_blocks_3, n_blocks_4,
-       activation_name,
-       base_channels]
-    """
-    return [
-        init_block_type(),
-        init_num_blocks(), init_num_blocks(), init_num_blocks(), init_num_blocks(),
-        init_activation(),
-        init_base_channels()
-    ]
+    def initialize_population(self):
+        return [self._create_individual() for _ in range(self.pop_size)]
 
-toolbox.register("individual", tools.initIterate, creator.Individual, init_individual)
-toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+    def evaluate_population(self, population, train_loader, val_loader):
+        with ProcessPoolExecutor(max_workers=len(self.devices)) as executor:
+            futures = []
+            for i, ind in enumerate(population):
+                device = self.devices[i % len(self.devices)]
+                futures.append(executor.submit(
+                    evaluate_individual,
+                    ind.genes,
+                    train_loader,
+                    val_loader,
+                    device,
+                    self.n_epochs
+                ))
 
-def decode_individual(ind):
-    # ind = [block_type, n1, n2, n3, n4, act_name, base_ch]
-    block_type = BasicBlock if ind[0] == 0 else Bottleneck
-    num_blocks_list = [ind[1], ind[2], ind[3], ind[4]]
-    act_name = ind[5]
-    base_ch = ind[6]
-    return block_type, num_blocks_list, act_name, base_ch
+            for future, ind in zip(futures, population):
+                ind.fitness = future.result()
 
-def init_worker(devs):
-    global WORKER_DEVICE
-    pid = multiprocessing.current_process()._identity[0] - 1
-    WORKER_DEVICE = devs[pid]
+        # Update hall of fame
+        current_best = max(population, key=lambda x: x.fitness)
+        if not self.hall_of_fame or current_best.fitness > self.hall_of_fame.fitness:
+            self.hall_of_fame = current_best
+
+    def _select_parent(self, population):
+        tournament = random.sample(population, 3)
+        return max(tournament, key=lambda x: x.fitness)
+
+    def _crossover(self, parent1, parent2):
+        if random.random() > self.cx_prob:
+            return parent1, parent2
+
+        cx_point = random.randint(1, len(parent1.genes) - 1)
+        child1 = Individual(parent1.genes[:cx_point] + parent2.genes[cx_point:])
+        child2 = Individual(parent2.genes[:cx_point] + parent1.genes[cx_point:])
+        return child1, child2
+
+    def _mutate(self, individual):
+        for i in range(len(individual.genes)):
+            if random.random() < self.mut_prob:
+                if i == 0:
+                    individual.genes[i] = random.randint(0, 1)
+                elif 1 <= i <= 4:
+                    individual.genes[i] = random.randint(2, 6)
+                elif i == 5:
+                    individual.genes[i] = random.choice(["relu", "tanh", "sigmoid"])
+                elif i == 6:
+                    individual.genes[i] = random.choice([32, 64, 128])
+        return individual
+
+    def evolve(self, train_loader, val_loader):
+        population = self.initialize_population()
+
+        for gen in range(self.n_generations):
+            self.evaluate_population(population, train_loader, val_loader)
+
+            fitnesses = [ind.fitness for ind in population]
+            print(f"\nGeneration {gen + 1}/{self.n_generations}")
+            print(f"Max Fitness: {max(fitnesses):.2f}")
+            print(f"Avg Fitness: {np.mean(fitnesses):.2f}")
+            print(f"Min Fitness: {min(fitnesses):.2f}")
+
+            new_pop = []
+            while len(new_pop) < self.pop_size:
+                parent1 = self._select_parent(population)
+                parent2 = self._select_parent(population)
+                child1, child2 = self._crossover(parent1, parent2)
+
+                for child in [child1, child2]:
+                    if len(new_pop) >= self.pop_size:
+                        break
+                    self._mutate(child)
+                    new_pop.append(child)
+
+            population = new_pop
+
+        return self.hall_of_fame
+
+
+def evaluate_individual(genes, train_loader, val_loader, device, n_epochs=5):
     random.seed(42)
     np.random.seed(42)
     torch.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
 
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
+    block_type = BasicBlock if genes[0] == 0 else Bottleneck
+    num_blocks = genes[1:5]
+    activation = genes[5]
+    base_ch = genes[6]
 
-    os.environ["PYTHONHASHSEED"] = '42'
+    model = FlexibleResNet(
+        block_type=block_type,
+        num_blocks_list=num_blocks,
+        activation_name=activation,
+        base_channels=base_ch
+    ).to(device)
 
-def evaluate_on_device(ind):
-    global TRAIN_LOADER, VAL_LOADER, WORKER_DEVICE
-    device = torch.device(f'cuda:{WORKER_DEVICE}')
-
-    block_type, num_blocks_list, act_name, base_ch = decode_individual(ind)
-
-    model = FlexibleResNet(block_type, num_blocks_list, 2, act_name, base_ch).to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = MyNAG(model.parameters(), lr=0.02)
+    optimizer = MyNAG(model.parameters(), lr=0.01)
 
-    best_val_acc = 0
-    
-    num_epochs = 50
-    for epoch in range(num_epochs):
-        train_model(model, criterion, optimizer, TRAIN_LOADER, device)
+    best_acc = 0.0
+    for epoch in range(n_epochs):
+        model.train()
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
 
         model.eval()
         correct, total = 0, 0
         with torch.no_grad():
-            for images, labels in VAL_LOADER:
+            for images, labels in val_loader:
                 images, labels = images.to(device), labels.to(device)
                 outputs = model(images)
-                _, preds = outputs.max(1)
-                correct += preds.eq(labels).sum().item()
+                _, preds = torch.max(outputs, 1)
+                correct += (preds == labels).sum().item()
                 total += labels.size(0)
-        val_acc = 100.0*correct/total if total else 0
-        best_val_acc = max(best_val_acc, val_acc)
-    
-    print(best_val_acc)
-    return (best_val_acc,)
 
-def cx_one_point(ind1, ind2):
-    cxpoint = random.randint(1, len(ind1)-1)
-    ind1[cxpoint:], ind2[cxpoint:] = ind2[cxpoint:], ind1[cxpoint:]
-    return ind1, ind2
+        acc = 100.0 * correct / total
+        if acc > best_acc:
+            best_acc = acc
 
-def mut_individual(ind, indpb=0.2):
-    """
-    С вероятностью indpb мутируем каждый ген
-    """
-    for i in range(len(ind)):
-        if random.random() < indpb:
-            if i == 0:
-                ind[i] = init_block_type()
-            elif 1 <= i <= 4:
-                ind[i] = init_num_blocks()
-            elif i == 5:
-                ind[i] = init_activation()
-            elif i == 6:
-                ind[i] = init_base_channels()
-    return (ind,)
+    return best_acc
 
-toolbox.register("mate", cx_one_point)
-toolbox.register("mutate", mut_individual, indpb=0.2)
-toolbox.register("select", tools.selTournament, tournsize=3)
 
-devices = [0, 1, 2]
-TRAIN_LOADER, VAL_LOADER = train_loader, val_loader
+def create_dataframe(data_dir):
+    data = []
+    for split in ['train', 'test']:
+        for label in ['benign', 'malignant']:
+            folder = os.path.join(data_dir, split, label)
+            for fname in os.listdir(folder):
+                if fname.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    data.append({
+                        'path': os.path.join(folder, fname),
+                        'label': 0 if label == 'benign' else 1,
+                        'split': split
+                    })
+    return pd.DataFrame(data)
 
-def evaluate_deap(ind):
-    return evaluate_on_device(ind)
-
-def run_ga(n_gen=10, pop_size=8):
-    global TRAIN_LOADER, VAL_LOADER, devices
-
-    pop = toolbox.population(n=pop_size)
-    hof = tools.HallOfFame(1)  # сохранить лучшее решение
-
-    stats = tools.Statistics(lambda ind: ind.fitness.values)
-    stats.register("mean", np.mean)
-    stats.register("std", np.std)
-    stats.register("min", np.min)
-    stats.register("max", np.max)
-    
-    n_devices = len(devices)
-    
-    pool = multiprocessing.Pool(
-        processes=n_devices,
-        initializer=init_worker,
-        initargs=(devices,)
-    )
-    
-    toolbox.register("map", pool.map)
-    
-    toolbox.register("evaluate", evaluate_deap)
-
-    pop, logbook = algorithms.eaSimple(
-        population=pop,
-        toolbox=toolbox,
-        cxpb=0.5,   # вероятность скрещивания
-        mutpb=0.3,  # вероятность мутации
-        ngen=n_gen,
-        stats=stats,
-        halloffame=hof,
-        verbose=True
-    )
-    
-    pool.close()
-    pool.join()
-
-    print("\nЛучший индивид:")
-    print(hof[0])
-    print("Лучший fitness (val_acc) =", hof[0].fitness.values[0])
-
-    # Декодируем в удобочитаемые параметры
-    best_block_type, best_blocks_list, best_act, best_base_ch = decode_individual(hof[0])
-    print(f"Тип блока: {best_block_type.__name__}, "
-          f"Блоки: {best_blocks_list}, "
-          f"Активация: {best_act}, "
-          f"Base Channels: {best_base_ch}")
-
-    return pop, hof, logbook
 
 if __name__ == '__main__':
-    mp.set_start_method("spawn", force=True)
-    final_pop, hall_of_fame, logs = run_ga(n_gen=10, pop_size=15)
-    print(hall_of_fame[0])
-    
-    with open('output.txt', 'w') as f:
-        f.write(str(hall_of_fame))
-        f.write('\n\n\n')
-        f.write(str(logs))
+    DATA_DIR = "data"
+    BATCH_SIZE = 64
+    DEVICES = [0, 1, 2]
+    N_GENERATIONS = 10
+    POP_SIZE = 15
+
+    df = create_dataframe(DATA_DIR)
+    train_df = df[df['split'] == 'train']
+    test_df = df[df['split'] == 'test']
+
+    train_df, val_df = train_test_split(train_df, test_size=0.2, random_state=42)
+
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+
+    train_loader = DataLoader(
+        ImageDataset(train_df, transform),
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=4
+    )
+    val_loader = DataLoader(
+        ImageDataset(val_df, transform),
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=4
+    )
+
+    ga = GeneticOptimizer(
+        pop_size=POP_SIZE,
+        n_generations=N_GENERATIONS,
+        devices=DEVICES,
+        n_epochs=50
+    )
+
+    best = ga.evolve(train_loader, val_loader)
+
+    print("\nBest Architecture:")
+    print(f"Block Type: {'Bottleneck' if best.genes[0] else 'BasicBlock'}")
+    print(f"Num Blocks: {best.genes[1:5]}")
+    print(f"Activation: {best.genes[5]}")
+    print(f"Base Channels: {best.genes[6]}")
+    print(f"Validation Accuracy: {best.fitness:.2f}%")
